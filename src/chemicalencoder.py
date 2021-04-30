@@ -1,11 +1,14 @@
-from os.path import join
+from os.path import join,exists
+from os import makedirs
+from os import environ
 import numpy as np
 import pandas as pd
 
 
 #tensorflow stuff
+environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
 import tensorflow as tf
-from tensorflow.keras.layers import Input, Embedding, Flatten, Dot, Dense,Concatenate,Masking,Dropout,Reshape
+from tensorflow.keras.layers import Input, Embedding, Flatten, Dot, Dense,Concatenate,Masking,Dropout,Reshape,GaussianNoise
 from tensorflow.keras.models import Model,load_model
 from tensorflow.keras.utils import plot_model
 from tensorflow.keras import regularizers,Sequential
@@ -13,14 +16,17 @@ from tensorflow.keras.optimizers import SGD
 from tensorflow.keras.activations import relu
 
 class ChemicalEncoder:
-    def __init__(self,species,min_val=-20,drop_hx=True):
-        self.species=np.asarray(species)
+    def __init__(self,species=None,min_val=-20,drop_hx=True):
         self.drop_hx=drop_hx
-        self.set_species_variables()
         self.min_val=min_val
+        if species is not None:
+            self.species=np.asarray(species)
+            self.set_species_variables()
+
+
 
     def create_model(self,layers,activation="relu",dropout=True,optimizer="adam",
-                 batch_size=32,loss_func="mse",repeat=False):
+                 batch_size=32,loss_func="mse",repeat=False,noise=0.0):
     
         if activation=="leaky":
             activation=tf.keras.layers.LeakyReLU(alpha=0.1)
@@ -38,8 +44,13 @@ class ChemicalEncoder:
         self.encoder=Model(encoder_input,encoder_output,name="encoder")
         
         decoder_input = Input(shape=(self.encoded_size,))
-        decoder_output=Dense(decoder_layers[0],activation=activation)(decoder_input)
-        for layer in decoder_layers[1:]:
+        if noise>0.0:
+            decoder_output=GaussianNoise(noise)(decoder_input)
+            n=1
+        else:
+            decoder_output=Dense(decoder_layers[1],activation=activation)(decoder_input)
+            n=2
+        for layer in decoder_layers[n:]:
             decoder_output=Dense(layer,activation=activation)(decoder_output)
         decoder_output=Dense(len(self.encoded_species),activation=activation)(decoder_output)
         self.decoder=Model(decoder_input,decoder_output,name="decoder")
@@ -58,21 +69,23 @@ class ChemicalEncoder:
             optmizer=SGD(lr=0.005,momentum=0.9)
         self.autoencoder.compile(loss=loss_func, optimizer=optimizer)
 
-    def save_model(self,model_folder):
+    def save_autoencoder(self,model_folder):
+        if not exists(model_folder):
+            makedirs(model_folder)
         self.encoder.save(join(model_folder,"encoder.h5"))
         self.decoder.save(join(model_folder,"decoder.h5"))
         pd.Series(self.species).to_csv(join(model_folder,"species.csv"),index=False,header=False)
 
-    def load_model(self,model_folder):
-        self.species=np.loadtxt(join(model_folder,"species.csv"),dtype=str)
+    def load_autoencoder(self,model_folder):
+        self.species=np.loadtxt(join(model_folder,"species.csv"),dtype=str,comments=None)
         self.set_species_variables()
-        self.encoder=load_model(join(model_folder,"encoder.h5"))
-        self.decoder=load_model(join(model_folder,"decoder.h5"))
+        self.encoder=load_model(join(model_folder,"encoder.h5"),compile=False)
+        self.decoder=load_model(join(model_folder,"decoder.h5"),compile=False)
         self.encoded_size=self.decoder.layers[0].output_shape[0][1]
         autoencoder_input = Input(shape=(len(self.encoded_species),))
         encoded_chem = self.encoder(autoencoder_input)
         decoded_chem = self.decoder(encoded_chem)
-        
+
         self.autoencoder = Model(autoencoder_input, decoded_chem, name="autoencoder")
 
     def set_species_variables(self):
@@ -107,8 +120,8 @@ class ChemicalEncoder:
 
         #logscale abundances so we don't favour large abundances only
         #set a minimum value so that we don't try to be accurate on values that are basically 0
-        df=np.log10(df.values)
-        df=np.where(df<self.min_val,self.min_val,df)
+        df=np.where(df<10.0**self.min_val,10.0**self.min_val,df)
+        df=np.log10(df)
         df=pd.DataFrame(columns=self.encoded_species,data=df)
         
         #we'll then scale values so they go from 0 to 1

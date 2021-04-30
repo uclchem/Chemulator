@@ -16,20 +16,26 @@ from tensorflow.keras.models import load_model as tf_load_model
 from tensorflow.keras.backend import sin as tf_sin
 
 class Chemulator:
-    def __init__(self,autoencoder_dir):
-        #neural nets to encode and decode abundances
-        self.autoencoder=ChemicalEncoder(["H","H+","H2","E-"],drop_hx=False)
-        self.autoencoder.load_model(autoencoder_dir)
-        
+    def __init__(self,autoencoder_dir=None,species=None):
 
         self.physics_labels=['gas_temp','gas_density','radfield','zeta','coldens','h2col','ccol',"metallicity"]
 
-        #get size of encoded chemical layer and the list of non-zero nodes
-        self.chem_labels=[f"Chem_{i+1}" for i in range(self.autoencoder.encoded_size)]
+        if autoencoder_dir is None:
+            self.encode_chem=False
+            self.chem_labels=species
+            self.species=species
+        else:
+            #neural nets to encode and decode abundances     
+            self.autoencoder=ChemicalEncoder(["H","H+","H2","E-"],drop_hx=False)
+            self.autoencoder.load_autoencoder(autoencoder_dir)
+            #get size of encoded chemical layer and the list of non-zero nodes
+            self.chem_labels=[f"Chem_{i+1}" for i in range(self.autoencoder.encoded_size)]
+            self.encode_chem=True
+            self.species=self.autoencoder.species
 
-        cs=np.asarray([1 if  "C" in x else 0 for x in self.autoencoder.species])
-        cs=cs+np.asarray([1 if  "C2" in x else 0 for x in self.autoencoder.species])
-        self.c_idxs=cs+np.asarray([2 if  "C3" in x else 0 for x in self.autoencoder.species])
+        cs=np.asarray([1 if  "C" in x else 0 for x in self.species])
+        cs=cs+np.asarray([1 if  "C2" in x else 0 for x in self.species])
+        self.c_idxs=cs+np.asarray([2 if  "C3" in x else 0 for x in self.species])
         self.models=[]
         self.model_names=[]
 
@@ -69,7 +75,7 @@ class Chemulator:
 
     def load_model(self,model_folder):
         models=glob(join(model_folder,"*.h5"))
-        self.models=[tf_load_model(model,custom_objects={"sin":tf_sin}) for model in models]
+        self.models=[tf_load_model(model,custom_objects={"sin":tf_sin},compile=False) for model in models]
         self.model_names=[]
         for i,model in enumerate(self.models):
             while self.models[i].name in self.model_names:
@@ -111,8 +117,8 @@ class Chemulator:
             that vary over orders of magnitude, min-max scale them and encoded abundances.
 
             returns (nsamples,n_inputs) array of scaled variables for emulator.
-        '''
-        input_data["metallicity"]=(input_data[self.autoencoder.species].values*self.c_idxs).sum(axis=1)
+    '''
+        input_data["metallicity"]=(input_data[self.species].values*self.c_idxs).sum(axis=1)
         input_data["metallicity"]=input_data["metallicity"]/2.6e-4
         try:
             inputs=np.log10(input_data[self.physics_labels].reset_index(drop=True))
@@ -141,12 +147,12 @@ class Chemulator:
         inputs[inputs>1]=1.0
         return inputs
 
-    def prepare_outputs(self,output_data,learn_scaling=False):
+    def prepare_outputs(self,output_data,learn_scaling=False,encode_abundances=True):
         outputs=output_data[["gas_temp","dust_temp"]].reset_index(drop=True)
         outputs=np.log10(outputs)
-        outputs=outputs.merge(
-            pd.DataFrame(columns=self.chem_labels,data=self.prepare_chemistry(output_data)),
-             left_index=True,right_index=True)
+
+        outputs=pd.concat([outputs,pd.DataFrame(columns=self.chem_labels,data=self.prepare_chemistry(output_data))],axis=1)
+ 
 
         #we want to scale outputs 0-1 too but I want same scaling for input and output chemistry so pull from input scaling tabloe
         if learn_scaling:
@@ -169,18 +175,26 @@ class Chemulator:
         outputs=outputs.values*(summary["max"]-summary["min"]).values
         outputs=outputs+summary["min"].values
 
-        df=self.recover_chemistry(outputs[:,2:])
-        df=pd.DataFrame(columns=self.autoencoder.species,data=df)
+        if self.encode_chem:
+            df=self.recover_chemistry(outputs[:,2:])
+        df=pd.DataFrame(columns=self.species,data=df)
         df["gas_temp"]=10.0**outputs[:,0]
         df["dust_temp"]=10.0**outputs[:,1]
-        return df[["gas_temp","dust_temp"]+list(self.autoencoder.species)]
+        return df[["gas_temp","dust_temp"]+list(self.species)]
 
     def prepare_chemistry(self,chem_data):
-        chem_data=self.autoencoder.prepare_inputs(chem_data)
-        chem_data=self.autoencoder.encode(chem_data)
+        if self.encode_chem:
+            chem_data=self.autoencoder.prepare_inputs(chem_data)
+            chem_data=self.autoencoder.encode(chem_data)
+        else:
+            chem_data=np.log10(chem_data)
+            chem_data=np.where(chem_data<-20,-20,chem_data)
         return chem_data
 
     def recover_chemistry(self,chem_data):
-        chem_data=self.autoencoder.decode(chem_data)
-        chem_data=self.autoencoder.recover_abundances(chem_data)
+        if self.encode_chem:
+            chem_data=self.autoencoder.decode(chem_data)
+            chem_data=self.autoencoder.recover_abundances(chem_data)
+        else:
+            chem_data=10.00*chem_data
         return chem_data
